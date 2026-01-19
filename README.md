@@ -60,4 +60,4 @@ To build and run the extension locally:
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](https://github.com/infinition/AcidBjorn/blob/main/LICENSE).
