@@ -4,6 +4,10 @@
   "description": "Bi-directional synchronization for Bjorn Cyberviking project",
   "version": "0.0.1",
   "publisher": "nephystos",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/infinition/AcidBjorn.git"
+  },
   "engines": {
     "vscode": "^1.75.0"
   },
