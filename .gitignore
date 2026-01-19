@@ -1,0 +1,10 @@
+node_modules
+out
+*.vsix
+.vscode-test
+.DS_Store
+*.log
+dist
+.env
+# VS Code internal storage for this extension if any
+.vscode

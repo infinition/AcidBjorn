@@ -1,0 +1,164 @@
+{
+  "name": "acid-bjorn",
+  "displayName": "Acid Bjorn",
+  "description": "Bi-directional synchronization for Bjorn Cyberviking project",
+  "version": "0.0.1",
+  "publisher": "nephystos",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "acid-bjorn.syncNow",
+        "title": "Acid Bjorn: Push to Remote",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "acid-bjorn.syncPull",
+        "title": "Acid Bjorn: Pull from Remote",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "acid-bjorn.openSettings",
+        "title": "Acid Bjorn: Open Settings",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "acid-bjorn.openFile",
+        "title": "Acid Bjorn: Open File"
+      },
+      {
+        "command": "acid-bjorn.toggleAutoSync",
+        "title": "Acid Bjorn: Toggle Auto-Sync"
+      }
+    ],
+    "configuration": {
+      "title": "Acid Bjorn",
+      "properties": {
+        "acidBjorn.remoteIp": {
+          "type": "string",
+          "default": "192.168.1.15",
+          "description": "IP address of the Raspberry Pi"
+        },
+        "acidBjorn.username": {
+          "type": "string",
+          "default": "bjorn",
+          "description": "SSH username"
+        },
+        "acidBjorn.password": {
+          "type": "string",
+          "default": "bjorn",
+          "description": "SSH password"
+        },
+        "acidBjorn.remotePath": {
+          "type": "string",
+          "default": "/home/bjorn/Bjorn",
+          "description": "Remote path on the Raspberry Pi"
+        },
+        "acidBjorn.localPath": {
+          "type": "string",
+          "default": "",
+          "description": "Local path to sync (leave empty to use current workspace root)"
+        },
+        "acidBjorn.privateKeyPath": {
+          "type": "string",
+          "default": "~/.ssh/id_rsa",
+          "description": "Path to your private SSH key (e.g., C:/Users/Name/.ssh/id_rsa)"
+        },
+        "acidBjorn.autoSync": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic synchronization on file change"
+        },
+        "acidBjorn.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Master switch to enable or disable Acid Bjorn synchronization"
+        },
+        "acidBjorn.exclusions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            ".git",
+            "node_modules",
+            ".DS_Store",
+            "out",
+            "*.vsix",
+            "__pycache__",
+            "*.pyc",
+            "*.db",
+            "*.db-shm",
+            "*.db-wal",
+            ".lgd-nfy0"
+          ],
+          "description": "List of files or directories to exclude from synchronization"
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "acid-bjorn.toggleEnabled",
+          "title": "Acid Bjorn: Toggle ON/OFF",
+          "icon": "$(power)"
+        },
+        {
+          "command": "acid-bjorn.syncNow",
+          "group": "navigation",
+          "when": "view == acidBjornExplorer"
+        },
+        {
+          "command": "acid-bjorn.syncPull",
+          "group": "navigation",
+          "when": "view == acidBjornExplorer"
+        },
+        {
+          "command": "acid-bjorn.openSettings",
+          "group": "navigation",
+          "when": "view == acidBjornExplorer"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "acid-bjorn",
+          "title": "Acid Bjorn",
+          "icon": "$(rocket)"
+        }
+      ]
+    },
+    "views": {
+      "acid-bjorn": [
+        {
+          "id": "acidBjornExplorer",
+          "name": "Sync Controls"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "ssh2": "^1.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.11.18",
+    "@types/ssh2": "^1.11.7",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^4.9.5"
+  }
+}
