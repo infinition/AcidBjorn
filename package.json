@@ -6,8 +6,12 @@
   "publisher": "nephystos",
   "repository": {
     "type": "git",
-    "url": "https://github.com/infinition/AcidBjorn.git"
+    "url": "https://github.com/infinition/AcidBjorn"
   },
+  "bugs": {
+    "url": "https://github.com/infinition/AcidBjorn/issues"
+  },
+  "homepage": "https://github.com/infinition/AcidBjorn#readme",
   "engines": {
     "vscode": "^1.75.0"
   },
