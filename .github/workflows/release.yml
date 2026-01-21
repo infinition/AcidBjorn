@@ -25,7 +25,7 @@ jobs:
         run: npm run compile
 
       - name: Package Extension
-        run: npx @vscode/vsce package --no-verify -o acidbjorn-${{ github.ref_name }}.vsix
+        run: npx @vscode/vsce package -o acidbjorn-${{ github.ref_name }}.vsix
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
