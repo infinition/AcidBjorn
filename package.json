@@ -2,7 +2,7 @@
   "name": "acid-bjorn",
   "displayName": "Acid Bjorn",
   "description": "Bi-directional synchronization for Bjorn Cyberviking project",
-  "version": "1.2",
+  "version": "1.2.0",
   "publisher": "nephystos",
   "repository": {
     "type": "git",
