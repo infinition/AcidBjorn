@@ -1,9 +1,13 @@
+<img width="128" height="128" alt="IDLE" src="https://github.com/user-attachments/assets/b2e2e2ba-e4b3-4b3c-ba8a-a6b9f7566c88" />
+
 # Acid Bjorn
 
 [![Visual Studio Marketplace](https://img.shields.io/visual-studio-marketplace/v/nephystos.acid-bjorn.svg)](https://marketplace.visualstudio.com/items?itemName=nephystos.acid-bjorn)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Acid Bjorn** is a VS Code extension designed for bi-directional synchronization between your local workspace and a remote project (specifically tailored for Bjorn Cyberviking projects). It allows for seamless development on your local machine while keeping a remote Raspberry Pi or server in sync.
+
+
 
 ## Features
 
