@@ -1,0 +1,4 @@
+Contact: https://github.com/infinition/AcidBjorn/issues
+Expires: 2027-01-28T23:09:36.000Z
+Preferred-Languages: en, fr
+Policy: https://github.com/infinition/AcidBjorn/blob/wiki/SECURITY.md
