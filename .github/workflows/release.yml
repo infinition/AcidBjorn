@@ -1,35 +1,76 @@
-name: Release
+name: Release VSCode Plugin
 
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
+      # 1️⃣ Checkout
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # 2️⃣ Node
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: 'npm'
 
+      # 3️⃣ Install deps
       - name: Install dependencies
         run: npm install
 
+      # 4️⃣ Compile
       - name: Compile
         run: npm run compile
 
+      # 5️⃣ Package VSIX
       - name: Package Extension
-        run: npx @vscode/vsce package -o acidbjorn-${{ github.ref_name }}.vsix
+        run: npx @vscode/vsce package -o acidsnip-${{ github.ref_name }}.vsix
 
+      # 6️⃣ Generate structured release notes
+      - name: Generate release notes
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+
+          if [ -z "$LAST_TAG" ]; then
+            echo "🚀 Initial release" >> $GITHUB_ENV
+          else
+            echo "### ✨ Features" >> $GITHUB_ENV
+            git log $LAST_TAG..HEAD --pretty=format:"- %s" | grep '^feat' | sed 's/^feat: //' >> $GITHUB_ENV || true
+
+            echo "" >> $GITHUB_ENV
+            echo "### 🐛 Fixes" >> $GITHUB_ENV
+            git log $LAST_TAG..HEAD --pretty=format:"- %s" | grep '^fix' | sed 's/^fix: //' >> $GITHUB_ENV || true
+
+            echo "" >> $GITHUB_ENV
+            echo "### 🧹 Other changes" >> $GITHUB_ENV
+            git log $LAST_TAG..HEAD --pretty=format:"- %s" | grep -vE '^(feat|fix):' >> $GITHUB_ENV || true
+          fi
+
+          echo "EOF" >> $GITHUB_ENV
+
+      # 7️⃣ Create GitHub Release
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: acidbjorn-${{ github.ref_name }}.vsix
+          name: ${{ github.ref_name }}
+          body: |
+            ## 🧩 AcidSnip – VS Code Extension
+
+            ${{ env.RELEASE_NOTES }}
+          files: acidsnip-${{ github.ref_name }}.vsix
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
