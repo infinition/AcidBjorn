@@ -11,11 +11,13 @@
 
 ## Features
 
+- **Sync Engine v2**: Persistent SSH/SFTP connection, retries with backoff, debounced autosync, and transfer queue with bounded concurrency.
 - **Bi-directional Sync**: Push local changes to remote or pull remote changes to local.
-- **Auto-Sync**: Automatically push changes to the remote server on file save.
+- **Auto-Sync**: Automatically push changes to the remote server on file save (debounced).
 - **Activity Bar Integration**: Dedicated sidebar for synchronization controls and status.
-- **SSH Support**: Secure connection using passwords or private keys.
-- **Exclusions**: Highly configurable exclusion list to skip unnecessary files (e.g., `.git`, `node_modules`).
+- **SSH Support**: Password or key auth with persistent session handling.
+- **Remote Dev Tools**: Run Python remotely, manage systemd services, and tail service logs.
+- **Scope Control**: Include/exclude globs with `mirror` or `selective` sync mode.
 - **Master Toggle**: Easily enable or disable synchronization globally.
 
 ## Installation
@@ -33,13 +35,24 @@ You can configure Acid Bjorn in your VS Code settings (`settings.json`) or via t
 |---------|---------|-------------|
 | `acidBjorn.enabled` | `false` | Master switch to enable/disable synchronization. |
 | `acidBjorn.remoteIp` | `192.168.1.15` | IP address of the remote machine. |
+| `acidBjorn.port` | `22` | SSH port. |
 | `acidBjorn.username` | `bjorn` | SSH username. |
 | `acidBjorn.password` | `bjorn` | SSH password (if not using private key). |
 | `acidBjorn.privateKeyPath` | `~/.ssh/id_rsa` | Path to your private SSH key. |
 | `acidBjorn.remotePath` | `/home/bjorn/Bjorn` | Target path on the remote machine. |
-| `acidBjorn.localPath` | `""` | Local path to sync (defaults to workspace root). |
+| `acidBjorn.localPath` | `""` | Local path to sync. If empty, Acid Bjorn auto-creates and uses `.acid-bjorn/Bjorn_YYYYMMDD_HHMMSS` inside the workspace. |
 | `acidBjorn.autoSync` | `true` | Enable automatic sync on file change. |
 | `acidBjorn.exclusions` | `[...]` | List of files/directories to exclude. |
+| `acidBjorn.includes` | `["**/*"]` | Include globs used by selective mode. |
+| `acidBjorn.syncMode` | `"mirror"` | `mirror` or `selective`. |
+| `acidBjorn.maxConcurrency` | `3` | Maximum parallel transfers (Pi Zero friendly). |
+| `acidBjorn.maxRetries` | `3` | Retries per transfer job. |
+| `acidBjorn.connectTimeoutMs` | `20000` | SSH connect timeout in milliseconds. |
+| `acidBjorn.operationTimeoutMs` | `30000` | SFTP operation timeout in milliseconds. |
+| `acidBjorn.pollingIntervalSec` | `10` | Polling fallback interval (future remote watcher mode). |
+| `acidBjorn.pythonPath` | `/usr/bin/python3` | Remote Python interpreter path. |
+| `acidBjorn.sudoByDefault` | `false` | Use sudo by default for remote tooling. |
+| `acidBjorn.services` | `[]` | List of systemd services for service commands. |
 
 ## Usage
 
@@ -49,6 +62,13 @@ Access the **Acid Bjorn** icon in the Activity Bar to:
 - **Pull from Remote**: Fetch the latest changes from the remote server.
 - **Toggle Auto-Sync**: Enable or disable automatic background synchronization.
 - **Open Settings**: Quickly access the extension configuration.
+
+### Explorer Context Actions
+- **Acid Bjorn: Sync This File/Folder**
+- **Acid Bjorn: Download Remote Version**
+- **Acid Bjorn: Add to Sync Scope (include)**
+- **Acid Bjorn: Exclude from Sync**
+- **Acid Bjorn: Run Python File Remotely**
 
 ### Status Bar
 A status bar item indicates whether synchronization is active and provides a quick toggle to enable/disable the extension.

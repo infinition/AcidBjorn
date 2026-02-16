@@ -1,327 +1,836 @@
 import * as vscode from 'vscode';
-import { Client, SFTPWrapper, ConnectConfig } from 'ssh2';
-import * as path from 'path';
 import * as fs from 'fs';
-import * as os from 'os';
+import * as path from 'path';
+import type { SFTPWrapper, FileEntry, Stats } from 'ssh2';
 import { BjornTreeDataProvider, SyncStatus } from './treeDataProvider';
+import { ConnectionManager, ConnectionState } from './core/ConnectionManager';
+import { TransferJob, TransferQueue } from './core/TransferQueue';
+import { getWorkspaceTarget } from './core/Config';
+import { Logger } from './core/Logger';
 
-export class SyncEngine {
-    private client: Client | null = null;
-    private sftp: SFTPWrapper | null = null;
-    private isSyncing: boolean = false;
+interface SyncSignature {
+    size: number;
+    mtimeSec: number;
+}
+
+type SyncDirection = 'push' | 'pull';
+type PendingChangeType = 'upsert' | 'delete';
+
+export class SyncEngine implements vscode.Disposable {
+    private readonly logger: Logger;
+    private connection?: ConnectionManager;
+    private queue: TransferQueue;
+    private debounceTimers = new Map<string, NodeJS.Timeout>();
+    private syncing = false;
+    private pullInProgress = false;
+    private statusState: ConnectionState = 'DISCONNECTED';
+    private lastSyncedSignature = new Map<string, SyncSignature>();
+    private readonly ignoreWatcherUntil = new Map<string, number>();
+    private readonly offlineJobs: TransferJob[] = [];
+    private readonly pendingChanges = new Map<string, PendingChangeType>();
+    private readonly onStateChangedEmitter = new vscode.EventEmitter<ConnectionState>();
+    private readonly onQueueChangedEmitter = new vscode.EventEmitter<{ pending: number; inflight: number; total: number }>();
+
+    public readonly onStateChanged = this.onStateChangedEmitter.event;
+    public readonly onQueueChanged = this.onQueueChangedEmitter.event;
 
     constructor(
-        private outputChannel: vscode.OutputChannel,
-        private treeDataProvider: BjornTreeDataProvider
-    ) { }
-
-    private getLocalRoot(): string | undefined {
-        const config = vscode.workspace.getConfiguration('acidBjorn');
-        const customPath = config.get<string>('localPath');
-        if (customPath && customPath.trim().length > 0) {
-            return customPath;
-        }
-        return vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+        private readonly outputChannel: vscode.OutputChannel,
+        private readonly treeDataProvider: BjornTreeDataProvider
+    ) {
+        this.logger = new Logger(outputChannel);
+        this.queue = new TransferQueue(3);
+        this.bindQueueEvents();
     }
 
-    private async connect(): Promise<SFTPWrapper> {
-        if (this.sftp) return this.sftp;
+    public get connectionState(): ConnectionState {
+        return this.statusState;
+    }
 
-        const config = vscode.workspace.getConfiguration('acidBjorn');
-        const host = config.get<string>('remoteIp');
-        const username = config.get<string>('username');
-        const password = config.get<string>('password');
-        let privateKeyPath = config.get<string>('privateKeyPath') || '';
+    private updateState(state: ConnectionState): void {
+        this.statusState = state;
+        this.treeDataProvider.setConnectionState(state);
+        this.onStateChangedEmitter.fire(state);
+    }
 
-        this.outputChannel.appendLine(`[SSH] Attempting to connect to ${username}@${host}...`);
-
-        const connectConfig: ConnectConfig = {
-            host,
-            port: 22,
-            username,
-            tryKeyboard: true,
-            readyTimeout: 20000
-        };
-
-        if (privateKeyPath) {
-            if (privateKeyPath.startsWith('~')) {
-                privateKeyPath = path.join(os.homedir(), privateKeyPath.slice(1));
+    private bindQueueEvents(): void {
+        this.queue.on('queueChanged', (snapshot: { pending: number; inflight: number; total: number }) => {
+            this.treeDataProvider.setQueueSnapshot(snapshot);
+            this.onQueueChangedEmitter.fire(snapshot);
+            if (snapshot.total === 0 && this.statusState === 'SYNCING') {
+                this.updateState('CONNECTED');
             }
-            if (fs.existsSync(privateKeyPath)) {
-                this.outputChannel.appendLine(`[SSH] Using private key: ${privateKeyPath}`);
-                connectConfig.privateKey = fs.readFileSync(privateKeyPath);
+        });
+
+        this.queue.on('jobStarted', (job: TransferJob) => {
+            this.updateState('SYNCING');
+            if (job.localPath) {
+                this.treeDataProvider.setFileStatus(job.localPath, SyncStatus.Pending);
             }
-        }
+        });
 
-        if (password) {
-            connectConfig.password = password;
-        }
+        this.queue.on('jobCompleted', (job: TransferJob) => {
+            if (job.localPath) {
+                this.treeDataProvider.setFileStatus(job.localPath, SyncStatus.Synced);
+            }
+            if (this.queue.snapshot().total === 0) {
+                this.updateState('CONNECTED');
+            }
+        });
 
-        return new Promise((resolve, reject) => {
-            this.client = new Client();
-            this.client.on('ready', () => {
-                this.outputChannel.appendLine('[SSH] Connected! Opening SFTP session...');
-                this.client!.sftp((err, sftp) => {
-                    if (err) {
-                        this.cleanup();
-                        reject(err);
-                    } else {
-                        this.sftp = sftp;
-                        resolve(sftp);
+        this.queue.on('jobRetry', (job: TransferJob, err: Error) => {
+            this.logger.warn(`Retry ${job.retries}/${job.maxRetries} for ${job.key}: ${err.message}`);
+            if (job.localPath) {
+                this.treeDataProvider.setFileStatus(job.localPath, SyncStatus.Pending);
+            }
+        });
+
+        this.queue.on('jobFailed', (job: TransferJob, err: Error) => {
+            this.logger.error(`Job failed ${job.type} ${job.key}: ${err.message}`);
+            if (job.localPath) {
+                this.treeDataProvider.setFileStatus(job.localPath, SyncStatus.Error);
+            }
+            this.updateState('ERROR');
+            void vscode.window
+                .showErrorMessage(`Acid Bjorn: ${job.type} failed (${path.basename(job.key)})`, 'Open Output Logs')
+                .then((action) => {
+                    if (action === 'Open Output Logs') {
+                        this.outputChannel.show(true);
                     }
                 });
-            }).on('error', (err) => {
-                this.cleanup();
-                reject(err);
-            }).on('close', () => {
-                this.cleanup();
-            }).connect(connectConfig);
         });
     }
 
-    private cleanup() {
-        this.sftp = null;
-        this.client = null;
+    private ensureConnectionForTarget(resource?: vscode.Uri): ConnectionManager | undefined {
+        const target = this.getManagedTarget();
+        if (!target) {
+            return undefined;
+        }
+
+        this.queue.updateConcurrency(target.settings.maxConcurrency);
+
+        const manager = ConnectionManager.getOrCreate(
+            {
+                host: target.settings.host,
+                port: target.settings.port,
+                username: target.settings.username,
+                remotePath: target.settings.remotePath
+            },
+            target.settings,
+            this.logger
+        );
+
+        if (this.connection !== manager) {
+            const previousConnection = this.connection;
+            previousConnection?.removeAllListeners('stateChanged');
+            previousConnection?.dispose();
+            this.connection = manager;
+            this.logger.info(`Using target ${target.settings.username}@${target.settings.host}:${target.settings.port}`);
+            manager.on('stateChanged', (state: ConnectionState) => {
+                this.updateState(state);
+                this.queue.setOnline(state === 'CONNECTED' || state === 'SYNCING');
+                if (state === 'CONNECTED' && this.offlineJobs.length > 0) {
+                    const queued = [...this.offlineJobs];
+                    this.offlineJobs.length = 0;
+                    for (const job of queued) {
+                        this.queue.enqueue(job);
+                    }
+                }
+            });
+        }
+
+        return manager;
+    }
+
+    public async connect(_resource?: vscode.Uri): Promise<void> {
+        const target = this.getManagedTarget();
+        if (!target) {
+            vscode.window.showWarningMessage('Acid Bjorn: No workspace found.');
+            return;
+        }
+
+        if (!target.settings.enabled) {
+            this.updateState('DISCONNECTED');
+            return;
+        }
+
+        const manager = this.ensureConnectionForTarget();
+        if (!manager) {
+            return;
+        }
+
+        try {
+            await manager.getSftp();
+            this.updateState('CONNECTED');
+        } catch (err: any) {
+            this.updateState('ERROR');
+            this.logger.error(`Connect failed: ${err.message}`);
+            throw err;
+        }
+    }
+
+    public disconnect(): void {
+        this.connection?.disconnect();
+        this.queue.setOnline(false);
+        this.updateState('DISCONNECTED');
+    }
+
+    public scheduleSyncFile(localPath: string, direction: SyncDirection = 'push'): void {
+        const normalized = vscode.Uri.file(localPath).fsPath;
+        if (this.shouldIgnoreWatcherEvent(normalized)) {
+            return;
+        }
+        if (direction === 'push') {
+            this.pendingChanges.set(normalized, 'upsert');
+        }
+        if (this.debounceTimers.has(normalized)) {
+            clearTimeout(this.debounceTimers.get(normalized)!);
+        }
+
+        this.debounceTimers.set(normalized, setTimeout(() => {
+            this.debounceTimers.delete(normalized);
+            void this.syncFile(normalized, direction);
+        }, 500));
+    }
+
+    public scheduleDelete(localPath: string): void {
+        const normalized = vscode.Uri.file(localPath).fsPath;
+        if (this.shouldIgnoreWatcherEvent(normalized)) {
+            return;
+        }
+        this.pendingChanges.set(normalized, 'delete');
+        void this.syncDelete(normalized);
+    }
+
+    public async syncFile(localPath: string, direction: SyncDirection = 'push'): Promise<void> {
+        const target = this.getManagedTarget();
+        if (!target || !target.settings.enabled) {
+            return;
+        }
+
+        if (!this.isPathInsideRoot(localPath, target.workspaceRoot)) {
+            return;
+        }
+
+        const relativePath = path.relative(target.workspaceRoot, localPath).replace(/\\/g, '/');
+        if (!relativePath || relativePath.startsWith('..') || this.isExcluded(relativePath, target.settings.exclusions)) {
+            return;
+        }
+
+        const remotePath = path.posix.join(target.settings.remotePath, relativePath);
+        const manager = this.ensureConnectionForTarget();
+        if (!manager) {
+            return;
+        }
+
+        await this.connect();
+
+        if (direction === 'push') {
+            const uploadJob = this.createUploadJob(localPath, remotePath, target.settings.maxRetries, target.settings.operationTimeoutMs);
+            if (this.connectionState === 'CONNECTED' || this.connectionState === 'SYNCING') {
+                this.queue.enqueue(uploadJob);
+            } else {
+                this.offlineJobs.push(uploadJob);
+            }
+        } else {
+            const downloadJob = this.createDownloadJob(localPath, remotePath, target.settings.maxRetries, target.settings.operationTimeoutMs);
+            if (this.connectionState === 'CONNECTED' || this.connectionState === 'SYNCING') {
+                this.queue.enqueue(downloadJob);
+            } else {
+                this.offlineJobs.push(downloadJob);
+            }
+        }
+    }
+
+    public async syncAll(): Promise<void> {
+        if (this.syncing) {
+            return;
+        }
+
+        const target = getWorkspaceTarget();
+        if (!target || !target.settings.enabled) {
+            vscode.window.showWarningMessage('Acid Bjorn is disabled.');
+            return;
+        }
+
+        await this.connect(target.workspaceFolder.uri);
+
+        await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Acid Bjorn: Push incremental to remote',
+                cancellable: false
+            },
+            async (progress) => {
+                this.syncing = true;
+                try {
+                    const changes = [...this.pendingChanges.entries()];
+                    if (changes.length === 0) {
+                        this.updateState('CONNECTED');
+                        vscode.window.showInformationMessage('Acid Bjorn: nothing to push.');
+                        return;
+                    }
+
+                    for (const [filePath, kind] of changes) {
+                        if (!this.isPathInsideRoot(filePath, target.workspaceRoot)) {
+                            continue;
+                        }
+                        const rel = path.relative(target.workspaceRoot, filePath).replace(/\\/g, '/');
+                        if (!rel || rel.startsWith('..') || this.isExcluded(rel, target.settings.exclusions)) {
+                            continue;
+                        }
+                        const remotePath = path.posix.join(target.settings.remotePath, rel);
+                        progress.report({ message: `${kind}: ${rel}` });
+                        if (kind === 'delete') {
+                            this.queue.enqueue(this.createDeleteJob(filePath, remotePath, target.settings.maxRetries, target.settings.operationTimeoutMs));
+                        } else {
+                            this.queue.enqueue(this.createUploadJob(filePath, remotePath, target.settings.maxRetries, target.settings.operationTimeoutMs));
+                        }
+                    }
+
+                    await this.waitForQueueDrain();
+                    this.updateState('CONNECTED');
+                    vscode.window.showInformationMessage('Acid Bjorn: Push completed.');
+                } finally {
+                    this.syncing = false;
+                }
+            }
+        );
+    }
+
+    public async syncPull(): Promise<void> {
+        if (this.syncing) {
+            return;
+        }
+
+        const target = getWorkspaceTarget();
+        if (!target || !target.settings.enabled) {
+            vscode.window.showWarningMessage('Acid Bjorn is disabled.');
+            return;
+        }
+
+        await this.connect(target.workspaceFolder.uri);
+
+        await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Acid Bjorn: Pull from remote',
+                cancellable: false
+            },
+            async (progress) => {
+                this.syncing = true;
+                this.pullInProgress = true;
+                try {
+                    const files = await this.collectRemoteFiles(target.settings.remotePath, target.settings.exclusions);
+                    for (const remotePath of files) {
+                        const rel = path.posix.relative(target.settings.remotePath, remotePath);
+                        const localPath = path.join(target.workspaceRoot, rel);
+                        progress.report({ message: rel });
+                        this.queue.enqueue(this.createDownloadJob(localPath, remotePath, target.settings.maxRetries, target.settings.operationTimeoutMs));
+                    }
+
+                    await this.waitForQueueDrain();
+                    vscode.window.showInformationMessage('Acid Bjorn: Pull completed.');
+                } finally {
+                    this.syncing = false;
+                    this.pullInProgress = false;
+                }
+            }
+        );
+    }
+
+    public async forcePushUri(uri: vscode.Uri): Promise<void> {
+        if (!this.isManagedPath(uri.fsPath)) {
+            vscode.window.showWarningMessage('Acid Bjorn: path is outside configured sync root, ignored.');
+            return;
+        }
+
+        const stat = await vscode.workspace.fs.stat(uri);
+        if (stat.type & vscode.FileType.Directory) {
+            const target = this.getManagedTarget();
+            if (!target) {
+                return;
+            }
+            const files = this.collectLocalFiles(uri.fsPath, target.settings.exclusions, target.settings.includes, target.settings.syncMode);
+            for (const filePath of files) {
+                await this.syncFile(filePath, 'push');
+            }
+            return;
+        }
+
+        await this.syncFile(uri.fsPath, 'push');
+    }
+
+    public async forcePullUri(uri: vscode.Uri): Promise<void> {
+        const target = this.getManagedTarget();
+        if (!target) {
+            return;
+        }
+        if (!this.isManagedPath(uri.fsPath)) {
+            vscode.window.showWarningMessage('Acid Bjorn: path is outside configured sync root, ignored.');
+            return;
+        }
+
+        const relativePath = path.relative(target.workspaceRoot, uri.fsPath).replace(/\\/g, '/');
+        if (relativePath.startsWith('..')) {
+            return;
+        }
+        const remotePath = path.posix.join(target.settings.remotePath, relativePath);
+        await this.syncFile(uri.fsPath, 'pull');
+        this.logger.info(`Queued pull for ${remotePath}`);
+    }
+
+    private async syncDelete(localPath: string): Promise<void> {
+        const target = this.getManagedTarget();
+        if (!target || !target.settings.enabled) {
+            return;
+        }
+        if (!this.isPathInsideRoot(localPath, target.workspaceRoot)) {
+            return;
+        }
+
+        const relativePath = path.relative(target.workspaceRoot, localPath).replace(/\\/g, '/');
+        if (!relativePath || relativePath.startsWith('..') || this.isExcluded(relativePath, target.settings.exclusions)) {
+            return;
+        }
+        const remotePath = path.posix.join(target.settings.remotePath, relativePath);
+
+        await this.connect();
+        const deleteJob = this.createDeleteJob(localPath, remotePath, target.settings.maxRetries, target.settings.operationTimeoutMs);
+        if (this.connectionState === 'CONNECTED' || this.connectionState === 'SYNCING') {
+            this.queue.enqueue(deleteJob);
+        } else {
+            this.offlineJobs.push(deleteJob);
+        }
+    }
+
+    private createUploadJob(localPath: string, remotePath: string, maxRetries: number, timeoutMs: number): TransferJob {
+        const tempRemotePath = `${remotePath}.__uploading__`;
+        const id = `upload:${remotePath}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+
+        return {
+            id,
+            key: `UPLOAD:${remotePath}`,
+            type: 'UPLOAD',
+            localPath,
+            remotePath,
+            tempRemotePath,
+            priority: 'high',
+            retries: 0,
+            maxRetries,
+            abortController: new AbortController(),
+            run: async (signal: AbortSignal) => {
+                const target = this.getManagedTarget();
+                if (!target || !this.connection) {
+                    throw new Error('Missing workspace target');
+                }
+
+                await this.ensureRemoteDir(path.posix.dirname(remotePath), timeoutMs);
+
+                const localStat = await fs.promises.stat(localPath);
+                const remoteStat = await this.statRemote(remotePath, timeoutMs).catch(() => undefined);
+                const localSignature: SyncSignature = {
+                    size: localStat.size,
+                    mtimeSec: Math.floor(localStat.mtimeMs / 1000)
+                };
+
+                if (remoteStat && this.isSameSignature(localSignature, { size: remoteStat.size, mtimeSec: remoteStat.mtime })) {
+                    this.lastSyncedSignature.set(localPath, localSignature);
+                    return;
+                }
+
+                const known = this.lastSyncedSignature.get(localPath);
+                if (known && !this.isSameSignature(known, localSignature) && remoteStat && !this.isSameSignature(known, { size: remoteStat.size, mtimeSec: remoteStat.mtime })) {
+                    await this.createConflictArtifacts(localPath, remotePath, timeoutMs);
+                    return;
+                }
+
+                await this.fastPut(localPath, tempRemotePath, timeoutMs, signal);
+                await this.renameRemote(tempRemotePath, remotePath, timeoutMs);
+                this.lastSyncedSignature.set(localPath, localSignature);
+                this.pendingChanges.delete(this.normalizePath(localPath));
+            }
+        };
+    }
+
+    private createDownloadJob(localPath: string, remotePath: string, maxRetries: number, timeoutMs: number): TransferJob {
+        const tempLocalPath = `${localPath}.__downloading__`;
+        const id = `download:${remotePath}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+
+        return {
+            id,
+            key: `DOWNLOAD:${remotePath}`,
+            type: 'DOWNLOAD',
+            localPath,
+            remotePath,
+            tempLocalPath,
+            priority: 'normal',
+            retries: 0,
+            maxRetries,
+            abortController: new AbortController(),
+            run: async (signal: AbortSignal) => {
+                const remoteStat = await this.statRemote(remotePath, timeoutMs);
+                const localStat = await fs.promises.stat(localPath).catch(() => undefined);
+
+                if (localStat) {
+                    const localSignature: SyncSignature = {
+                        size: localStat.size,
+                        mtimeSec: Math.floor(localStat.mtimeMs / 1000)
+                    };
+                    if (this.isSameSignature(localSignature, { size: remoteStat.size, mtimeSec: remoteStat.mtime })) {
+                        this.lastSyncedSignature.set(localPath, localSignature);
+                        return;
+                    }
+                }
+
+                await fs.promises.mkdir(path.dirname(localPath), { recursive: true });
+                this.markPathIgnored(tempLocalPath, 30000);
+                this.markPathIgnored(localPath, 30000);
+                await this.fastGet(remotePath, tempLocalPath, timeoutMs, signal);
+                await fs.promises.rename(tempLocalPath, localPath);
+                this.lastSyncedSignature.set(localPath, {
+                    size: remoteStat.size,
+                    mtimeSec: remoteStat.mtime
+                });
+            }
+        };
+    }
+
+    private createDeleteJob(localPath: string, remotePath: string, maxRetries: number, timeoutMs: number): TransferJob {
+        const id = `delete:${remotePath}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+        return {
+            id,
+            key: `DELETE:${remotePath}`,
+            type: 'DELETE',
+            localPath,
+            remotePath,
+            priority: 'high',
+            retries: 0,
+            maxRetries,
+            abortController: new AbortController(),
+            run: async () => {
+                const sftp = await this.getSftp();
+                await this.withTimeout(
+                    new Promise<void>((resolve) => {
+                        sftp.unlink(remotePath, () => resolve());
+                    }),
+                    timeoutMs,
+                    `delete timeout ${path.basename(remotePath)}`
+                );
+                this.pendingChanges.delete(this.normalizePath(localPath));
+            }
+        };
+    }
+
+    private async createConflictArtifacts(localPath: string, remotePath: string, timeoutMs: number): Promise<void> {
+        const ts = Date.now();
+        const localConflict = `${localPath}.conflict.LOCAL.${ts}`;
+        const remoteConflict = `${localPath}.conflict.REMOTE.${ts}`;
+        this.markPathIgnored(localConflict, 30000);
+        this.markPathIgnored(remoteConflict, 30000);
+        await fs.promises.copyFile(localPath, localConflict).catch(() => undefined);
+        await this.fastGet(remotePath, remoteConflict, timeoutMs).catch(() => undefined);
+        this.treeDataProvider.addConflict(localPath, localConflict, remoteConflict);
+        void vscode.window.showWarningMessage(`Acid Bjorn conflict detected for ${path.basename(localPath)}`, 'Open Conflicts').then((action) => {
+            if (action === 'Open Conflicts') {
+                vscode.commands.executeCommand('acid-bjorn.openConflictsView');
+            }
+        });
+    }
+
+    public shouldIgnoreWatcherEvent(localPath: string): boolean {
+        if (!this.isManagedPath(localPath)) {
+            return true;
+        }
+        const normalized = vscode.Uri.file(localPath).fsPath;
+        const now = Date.now();
+        const ignoreUntil = this.ignoreWatcherUntil.get(normalized);
+        if (ignoreUntil && ignoreUntil > now) {
+            return true;
+        }
+        if (ignoreUntil && ignoreUntil <= now) {
+            this.ignoreWatcherUntil.delete(normalized);
+        }
+        if (this.pullInProgress) {
+            return true;
+        }
+
+        return this.isInternalPath(normalized);
+    }
+
+    public isManagedPath(localPath: string): boolean {
+        const target = this.getManagedTarget();
+        if (!target) {
+            return false;
+        }
+        return this.isPathInsideRoot(localPath, target.workspaceRoot);
+    }
+
+    private markPathIgnored(localPath: string, durationMs: number): void {
+        const normalized = vscode.Uri.file(localPath).fsPath;
+        this.ignoreWatcherUntil.set(normalized, Date.now() + durationMs);
+    }
+
+    private isInternalPath(localPath: string): boolean {
+        const lower = localPath.toLowerCase();
+        return lower.endsWith('.__downloading__')
+            || lower.endsWith('.__uploading__')
+            || lower.includes('.conflict.local.')
+            || lower.includes('.conflict.remote.');
     }
 
     private normalizePath(p: string): string {
         return vscode.Uri.file(p).fsPath;
     }
 
-    public async syncFile(localPath: string) {
-        const config = vscode.workspace.getConfiguration('acidBjorn');
-        if (!config.get<boolean>('enabled')) return;
-
-        const remoteRoot = config.get<string>('remotePath');
-        const workspaceRoot = this.getLocalRoot();
-
-        if (!workspaceRoot || !remoteRoot) return;
-
-        const normalizedLocalPath = this.normalizePath(localPath);
-        const normalizedWorkspaceRoot = this.normalizePath(workspaceRoot);
-
-        if (!normalizedLocalPath.startsWith(normalizedWorkspaceRoot)) return;
-
-        const relativePath = path.relative(normalizedWorkspaceRoot, normalizedLocalPath);
-        if (this.isExcluded(relativePath) || relativePath.startsWith('..')) return;
-
-        const remotePath = path.posix.join(remoteRoot, relativePath.replace(/\\/g, '/'));
-
-        try {
-            const sftp = await this.connect();
-
-            this.outputChannel.appendLine(`[Sync] Uploading ${relativePath}...`);
-            this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Pending);
-
-            await this.ensureRemoteDir(path.posix.dirname(remotePath));
-
-            await new Promise<void>((resolve, reject) => {
-                sftp.fastPut(normalizedLocalPath, remotePath, (err) => {
-                    if (err) reject(err);
-                    else resolve();
-                });
-            });
-
-            this.outputChannel.appendLine(`[Success] Uploaded ${relativePath}`);
-            this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Synced);
-        } catch (err: any) {
-            this.outputChannel.appendLine(`[Error] Failed to upload ${relativePath}: ${err.message}`);
-            this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Error);
-        }
+    private getManagedTarget() {
+        return getWorkspaceTarget();
     }
 
-    private async ensureRemoteDir(remoteDir: string): Promise<void> {
-        const sftp = await this.connect();
-        const parts = remoteDir.split('/').filter(p => p.length > 0);
-        let currentPath = remoteDir.startsWith('/') ? '/' : '';
+    private isPathInsideRoot(localPath: string, workspaceRoot: string): boolean {
+        const normalizedPath = vscode.Uri.file(localPath).fsPath;
+        const normalizedRoot = vscode.Uri.file(workspaceRoot).fsPath;
+        const rootPrefix = normalizedRoot.endsWith(path.sep) ? normalizedRoot : `${normalizedRoot}${path.sep}`;
+        return normalizedPath === normalizedRoot || normalizedPath.startsWith(rootPrefix);
+    }
 
+    private isSameSignature(a: SyncSignature, b: SyncSignature): boolean {
+        return a.size === b.size && Math.abs(a.mtimeSec - b.mtimeSec) <= 2;
+    }
+
+    private async ensureRemoteDir(remoteDir: string, timeoutMs: number): Promise<void> {
+        const sftp = await this.getSftp();
+        const parts = remoteDir.split('/').filter(Boolean);
+        let current = remoteDir.startsWith('/') ? '/' : '';
         for (const part of parts) {
-            currentPath = path.posix.join(currentPath, part);
-            try {
-                await new Promise<void>((resolve, reject) => {
-                    sftp.mkdir(currentPath, (err: any) => {
-                        if (err && err.code !== 4) reject(err);
-                        else resolve();
-                    });
+            current = path.posix.join(current, part);
+            await this.withTimeout(
+                new Promise<void>((resolve) => {
+                    sftp.mkdir(current, () => resolve());
+                }),
+                timeoutMs,
+                `mkdir timeout ${current}`
+            );
+        }
+    }
+
+    private async collectRemoteFiles(remoteRoot: string, exclusions: string[]): Promise<string[]> {
+        const files: string[] = [];
+        const walk = async (remoteDir: string): Promise<void> => {
+            const entries = await this.readDir(remoteDir, 30000);
+            for (const entry of entries) {
+                const remotePath = path.posix.join(remoteDir, entry.filename);
+                const rel = path.posix.relative(remoteRoot, remotePath);
+                if (this.isExcluded(rel, exclusions)) {
+                    continue;
+                }
+                const isDir = entry.longname?.startsWith('d') || ((entry.attrs.mode ?? 0) & 0o40000) === 0o40000;
+                if (isDir) {
+                    await walk(remotePath);
+                } else {
+                    files.push(remotePath);
+                }
+            }
+        };
+
+        await walk(remoteRoot);
+        return files;
+    }
+
+    private collectLocalFiles(root: string, exclusions: string[], includes: string[], syncMode: 'mirror' | 'selective'): string[] {
+        const files: string[] = [];
+
+        const shouldInclude = (rel: string): boolean => {
+            if (this.isExcluded(rel, exclusions)) {
+                return false;
+            }
+
+            if (syncMode === 'mirror') {
+                return true;
+            }
+
+            if (includes.length === 0) {
+                return true;
+            }
+
+            return includes.some((pattern) => this.matchesPattern(rel, pattern));
+        };
+
+        const walk = (dir: string): void => {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.relative(root, fullPath).replace(/\\/g, '/');
+
+                if (entry.isDirectory()) {
+                    if (this.isExcluded(rel, exclusions)) {
+                        continue;
+                    }
+                    walk(fullPath);
+                } else if (shouldInclude(rel)) {
+                    files.push(fullPath);
+                }
+            }
+        };
+
+        if (fs.existsSync(root)) {
+            walk(root);
+        }
+
+        return files;
+    }
+
+    private matchesPattern(filePath: string, pattern: string): boolean {
+        const escaped = pattern
+            .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+            .replace(/\*\*/g, '.*')
+            .replace(/\*/g, '[^/]*');
+
+        return new RegExp(`^${escaped}$`).test(filePath);
+    }
+
+    private isExcluded(relativePath: string, exclusions: string[]): boolean {
+        return exclusions.some((pattern) => this.matchesPattern(relativePath, pattern) || relativePath.includes(pattern));
+    }
+
+    private async getSftp(): Promise<SFTPWrapper> {
+        if (!this.connection) {
+            throw new Error('Connection manager not initialized');
+        }
+        return this.connection.getSftp();
+    }
+
+    private async readDir(remotePath: string, timeoutMs: number): Promise<FileEntry[]> {
+        const sftp = await this.getSftp();
+        return this.withTimeout(
+            new Promise<FileEntry[]>((resolve, reject) => {
+                sftp.readdir(remotePath, (err, list) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    resolve(list ?? []);
                 });
-            } catch (err) { }
-        }
+            }),
+            timeoutMs,
+            `readdir timeout ${remotePath}`
+        );
     }
 
-    public async syncAll() {
-        if (this.isSyncing) return;
-        const config = vscode.workspace.getConfiguration('acidBjorn');
-        if (!config.get<boolean>('enabled')) {
-            vscode.window.showWarningMessage('Acid Bjorn is disabled. Enable it first.');
-            return;
+    private async statRemote(remotePath: string, timeoutMs: number): Promise<Stats> {
+        const sftp = await this.getSftp();
+        return this.withTimeout(
+            new Promise<Stats>((resolve, reject) => {
+                sftp.stat(remotePath, (err, stats) => {
+                    if (err || !stats) {
+                        reject(err ?? new Error('Remote stat unavailable'));
+                        return;
+                    }
+                    resolve(stats);
+                });
+            }),
+            timeoutMs,
+            `stat timeout ${remotePath}`
+        );
+    }
+
+    private async renameRemote(from: string, to: string, timeoutMs: number): Promise<void> {
+        const sftp = await this.getSftp();
+        await this.withTimeout(
+            new Promise<void>((resolve, reject) => {
+                sftp.rename(from, to, (err) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    resolve();
+                });
+            }),
+            timeoutMs,
+            `rename timeout ${from}`
+        );
+    }
+
+    private async fastPut(localPath: string, remotePath: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+        const sftp = await this.getSftp();
+        if (signal?.aborted) {
+            throw new Error('Transfer aborted');
         }
 
-        const workspaceRoot = this.getLocalRoot();
-        if (!workspaceRoot) return;
+        await this.withTimeout(
+            new Promise<void>((resolve, reject) => {
+                sftp.fastPut(localPath, remotePath, (err) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    resolve();
+                });
+            }),
+            timeoutMs,
+            `upload timeout ${path.basename(localPath)}`
+        );
+    }
 
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: "Acid Bjorn: Pushing to remote...",
-            cancellable: false
-        }, async (progress) => {
-            this.isSyncing = true;
-            this.outputChannel.appendLine('[Sync] Starting full workspace push...');
-            try {
-                await this.uploadDir(workspaceRoot, '', progress);
-                this.outputChannel.appendLine('[Success] Full push completed.');
-                vscode.window.showInformationMessage('Acid Bjorn: Push completed!');
-            } catch (err: any) {
-                this.outputChannel.appendLine(`[Error] Push failed: ${err.message}`);
-                vscode.window.showErrorMessage(`Acid Bjorn: Push failed: ${err.message}`);
-            } finally {
-                this.isSyncing = false;
-                this.treeDataProvider.refresh();
-            }
+    private async fastGet(remotePath: string, localPath: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+        const sftp = await this.getSftp();
+        if (signal?.aborted) {
+            throw new Error('Transfer aborted');
+        }
+
+        await this.withTimeout(
+            new Promise<void>((resolve, reject) => {
+                sftp.fastGet(remotePath, localPath, (err) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    resolve();
+                });
+            }),
+            timeoutMs,
+            `download timeout ${path.basename(remotePath)}`
+        );
+    }
+
+    private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+        let timeout: NodeJS.Timeout | undefined;
+        const timeoutPromise = new Promise<T>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
         });
-    }
-
-    private async uploadDir(localDir: string, relativePath: string, progress: vscode.Progress<{ message?: string }>) {
-        if (this.isExcluded(relativePath)) return;
-
-        const files = fs.readdirSync(localDir);
-        for (const file of files) {
-            const localPath = path.join(localDir, file);
-            const relPath = path.join(relativePath, file).replace(/\\/g, '/');
-
-            if (this.isExcluded(relPath)) continue;
-
-            const stats = fs.statSync(localPath);
-            if (stats.isDirectory()) {
-                await this.uploadDir(localPath, relPath, progress);
-            } else {
-                progress.report({ message: relPath });
-                await this.syncFileInternal(localPath, relPath);
-            }
-        }
-    }
-
-    private async syncFileInternal(localPath: string, relativePath: string) {
-        const config = vscode.workspace.getConfiguration('acidBjorn');
-        const remoteRoot = config.get<string>('remotePath');
-        if (!remoteRoot) return;
-
-        const remotePath = path.posix.join(remoteRoot, relativePath);
-        const sftp = await this.connect();
-        const normalizedLocalPath = this.normalizePath(localPath);
 
         try {
-            const stats = fs.statSync(normalizedLocalPath);
-            const remoteStats: any = await new Promise((resolve) => {
-                sftp.stat(remotePath, (err, res) => resolve(err ? null : res));
-            });
-
-            if (remoteStats && remoteStats.size === stats.size && Math.abs(remoteStats.mtime - Math.floor(stats.mtimeMs / 1000)) < 2) {
-                this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Synced);
-                return;
+            return await Promise.race([promise, timeoutPromise]);
+        } finally {
+            if (timeout) {
+                clearTimeout(timeout);
             }
-        } catch (e) { }
-
-        this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Pending);
-        await this.ensureRemoteDir(path.posix.dirname(remotePath));
-
-        await new Promise<void>((resolve, reject) => {
-            sftp.fastPut(normalizedLocalPath, remotePath, (err) => {
-                if (err) reject(err);
-                else resolve();
-            });
-        });
-        this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Synced);
+        }
     }
 
-    public async syncPull() {
-        if (this.isSyncing) {
-            this.outputChannel.appendLine('[Sync] Already syncing, skipping pull.');
-            return;
-        }
-        const config = vscode.workspace.getConfiguration('acidBjorn');
-        if (!config.get<boolean>('enabled')) {
-            vscode.window.showWarningMessage('Acid Bjorn is disabled. Enable it first.');
+    private async waitForQueueDrain(): Promise<void> {
+        if (this.queue.snapshot().total === 0) {
             return;
         }
 
-        const workspaceRoot = this.getLocalRoot();
-        const remoteRoot = config.get<string>('remotePath');
-
-        if (!workspaceRoot || !remoteRoot) return;
-
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: "Acid Bjorn: Pulling from remote...",
-            cancellable: false
-        }, async (progress) => {
-            this.isSyncing = true;
-            this.outputChannel.appendLine('[Sync] Starting pull from remote...');
-            try {
-                const sftp = await this.connect();
-                await this.downloadDir(sftp, remoteRoot, workspaceRoot, progress);
-                this.outputChannel.appendLine('[Success] Pull completed.');
-                vscode.window.showInformationMessage('Acid Bjorn: Pull completed!');
-            } catch (err: any) {
-                this.outputChannel.appendLine(`[Error] Pull failed: ${err.message}`);
-                vscode.window.showErrorMessage(`Acid Bjorn: Pull failed: ${err.message}`);
-            } finally {
-                this.isSyncing = false;
-                this.treeDataProvider.refresh();
-            }
-        });
-    }
-
-    private async downloadDir(sftp: SFTPWrapper, remoteDir: string, localDir: string, progress: vscode.Progress<{ message?: string }>) {
-        const list: any[] = await new Promise((resolve, reject) => {
-            sftp.readdir(remoteDir, (err, res) => err ? reject(err) : resolve(res));
-        });
-
-        for (const item of list) {
-            const remotePath = path.posix.join(remoteDir, item.filename);
-            const localPath = path.join(localDir, item.filename);
-            const workspaceRoot = this.getLocalRoot() || '';
-            const relPath = path.relative(workspaceRoot, localPath).replace(/\\/g, '/');
-
-            if (this.isExcluded(relPath)) continue;
-
-            if (item.attrs.isDirectory()) {
-                if (!fs.existsSync(localPath)) {
-                    fs.mkdirSync(localPath, { recursive: true });
+        await new Promise<void>((resolve) => {
+            const listener = (snapshot: { total: number }) => {
+                if (snapshot.total === 0) {
+                    this.queue.off('queueChanged', listener);
+                    resolve();
                 }
-                await this.downloadDir(sftp, remotePath, localPath, progress);
-            } else {
-                progress.report({ message: relPath });
-                const normalizedLocalPath = this.normalizePath(localPath);
-                this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Pending);
-                try {
-                    await new Promise<void>((resolve, reject) => {
-                        sftp.fastGet(remotePath, normalizedLocalPath, (err) => err ? reject(err) : resolve());
-                    });
-                    this.outputChannel.appendLine(`[Success] Downloaded ${relPath}`);
-                    this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Synced);
-                } catch (err: any) {
-                    this.outputChannel.appendLine(`[Error] Failed to download ${relPath}: ${err.message}`);
-                    this.treeDataProvider.setFileStatus(normalizedLocalPath, SyncStatus.Error);
-                }
-            }
-        }
-    }
-
-    private isExcluded(relativePath: string): boolean {
-        const exclusions = vscode.workspace.getConfiguration('acidBjorn').get<string[]>('exclusions') || [];
-        return exclusions.some(pattern => {
-            if (pattern.includes('*')) {
-                const regex = new RegExp('^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
-                return regex.test(path.basename(relativePath));
-            }
-            return relativePath.includes(pattern);
+            };
+            this.queue.on('queueChanged', listener);
         });
     }
 
-    public dispose() {
-        if (this.client) {
-            this.client.end();
+    public dispose(): void {
+        for (const timer of this.debounceTimers.values()) {
+            clearTimeout(timer);
         }
-        this.cleanup();
+        this.debounceTimers.clear();
+        this.connection?.dispose();
+        this.onStateChangedEmitter.dispose();
+        this.onQueueChangedEmitter.dispose();
     }
 }
